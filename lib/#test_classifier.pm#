@@ -1,0 +1,445 @@
+package test_classifier;
+
+use Moose;
+use Moose::Util::TypeConstraints;
+use TCNUtil::types;
+
+use Carp;
+
+use Data::Dumper;
+
+use pdb::automatic_patches;
+use test_patch;
+use TCNUtil::confusion_table;
+use TCNUtil::local::error;
+
+has 'antigen_array' => (
+    is => 'rw',
+    isa => 'ArrayRef[chain]',
+    required => 1,
+);
+
+# Datum = patch
+has 'confusion_table_patch' => (
+    is => 'ro',
+    isa => 'confusion_table',
+    lazy => 1,
+    clearer => '_reset_patch_table',
+    default => sub { confusion_table->new( item_class => 'test_patch' ) },
+);
+
+# Datum = resSeq
+has 'confusion_table_all_residues' => (
+    is => 'rw',
+    isa => 'confusion_table',
+    lazy => 1,
+    clearer => '_reset_all_residues_table',
+    default => sub { confusion_table->new( item_class => 'pdbresid' ) },
+);
+
+# Datum = resSeqs found in patches only
+has 'confusion_table_surf_residues'  => (
+    is => 'rw',
+    isa => 'confusion_table',
+    lazy => 1,
+    clearer => '_reset_surf_residues_table',
+    default => sub { confusion_table->new( item_class => 'pdbresid' ) },
+);
+
+has 'patchlib' => (
+    is => 'rw',
+    isa => 'patchlib',
+    required => 1,
+);
+
+has 'classifier' => (
+    is => 'rw',
+    isa => 'classifier',
+    required => 1,
+);
+
+has 'cluster' => (
+    is => 'rw',
+    isa => 'Bool',
+    default => 0,
+);
+
+has 'pdbResID2LabelHref' => (
+    is => 'rw',
+    isa => 'HashRef',
+    predicate => 'has_pdbResID2LabelHref',
+);
+
+# Hashed by antigen pdbid (pdb+chainid)
+has '_patch_hash' => (
+    is => 'rw',
+    isa => 'HashRef',
+    lazy => 1,
+    default => sub { {} },
+);
+
+# Hashed by antigen pdbid -> cent atom resid
+has '_large_patch_hash' => (
+    is => 'rw',
+    isa => 'HashRef',
+    lazy => 1,
+    default => sub { {} },
+);
+
+has 'errors' => (
+    traits => ['Array'],
+    is => 'rw',
+    isa => 'ArrayRef',
+    handles => {
+        add_error => 'push'
+        },
+    default => sub { [] },
+);
+
+# Run automatic_patches
+sub BUILD {
+    my $self = shift;
+
+    # Get patches for each antigen
+    foreach my $antigen ( @{ $self->antigen_array } ) {
+
+        my $pdbid = $antigen->pdb_code() . $antigen->chain_id();
+
+        print "Processing pdbid $pdbid\n";
+
+        my %autopatch_args
+            = ( pdb_object => $antigen,
+                radius     => 8,
+                patch_type => 'contact',
+            );
+        
+        my $autop = automatic_patches->new(%autopatch_args);
+
+        my %lpatches  = ();
+
+        # Create large patches for cluster mode
+        if ($self->cluster) {
+            my %lpatch_args
+                = ( pdb_object => $antigen,
+                    radius     => 16,
+                    patch_type => 'contact',
+                );
+            
+            my $lpatch = automatic_patches->new(%lpatch_args);
+
+            print "Creating large patches for cluster mode\n";
+            
+            # Hash large patches by pdbresid
+            my @patches = eval { $lpatch->get_patches };
+            if ( ! @patches ){
+                my $err_string
+                    =  "No patches created for pdb " . $antigen->pdb_code()
+                     . " $@";
+
+                my $err = local::error->new(message => $err_string,
+                                            type => 'NoPatches',
+                                            data => { pdb => $antigen });
+                
+                $self->add_error($err);
+                next;
+            }
+
+            foreach my $patch ( @patches ) {
+                if ( ref $patch eq 'local::error' ) {
+                    $self->add_error($patch);
+                    next;
+                }
+                my $chainID  = $patch->central_atom->chainID;
+                my $resSeq   = $patch->central_atom->resSeq;
+                my $resid    = $chainID . $resSeq;
+                $resid .= $patch->central_atom->iCode()
+                    if $patch->central_atom->has_iCode;
+                
+                my $pdbresid = $patch->pdb_code() . $resid;
+                $lpatches{$pdbresid} = $patch;
+            }
+
+        }
+
+        print "Creating patches\n";
+        
+        my @patches = eval { $autop->get_patches };
+        if ( ! @patches ){
+            my $err_string
+                =  "No patches created for pdb " . $antigen->pdb_code()
+                    . " $@";
+            
+            my $err = local::error->new(message => $err_string,
+                                        type => 'NoPatches',
+                                        data => { pdb => $antigen }
+                                     );       
+            $self->add_error($err);
+            next;
+        }
+        else {
+            $self->_patch_hash->{$pdbid} = \@patches;
+        }
+
+        $self->_large_patch_hash->{$pdbid} = \%lpatches;
+        
+    }
+    return 1;
+}
+
+sub run {
+    my $self = shift;
+
+    # Ensure that patchlib has been translated using classifier
+    $self->patchlib->set_classifier($self->classifier);
+    $self->patchlib->translate();
+
+    # Reset confusion tables
+    $self->_reset_patch_table();
+    $self->_reset_all_residues_table();
+    $self->_reset_surf_residues_table();
+    
+    # Check for errors any antigen where no patches have been created
+    my %no_patches = ();
+    
+    foreach my $error (@{$self->errors()}) {
+        if ($error->type eq 'NoPatches') {
+            $no_patches{$error->data->{pdb}->pdb_code()} = 1;
+        }
+    }
+    
+    foreach my $antigen (@{$self->antigen_array()}) {
+        if (exists $no_patches{$antigen->pdb_code()}) {
+            print "Skipping " . $antigen->pdb_code()
+                . ", no patches were created\n";
+            next;
+        }
+        
+        my %pos_preds = ();
+        my %pdbresid_h = ();
+        
+        # Get chain pdbresids for per-residue prediction
+        foreach my $pdbresid ( keys %{ $antigen->pdbresid_index } ) {
+            # Array = value, prediction, found in a patch
+            $pdbresid_h{$pdbresid} = [0, 0, 0];
+        }
+        
+        my $pdbid = $antigen->pdb_code() . $antigen->chain_id();        
+        my @patches = @{$self->_patch_hash->{$pdbid}};
+        my %lpatches = %{$self->_large_patch_hash->{$pdbid}};
+
+        # Label patches
+        map {$self->label_patch($_, $antigen, \%pdbresid_h, \%pos_preds)} @patches;
+        
+        # If cluster mode, adjust predictions so that only pos pred patches
+        # that are close to other pos pred predictions remain positive
+        if ($self->cluster) {            
+            foreach my $central_resid ( keys %pos_preds ) {
+                my $datum = $pos_preds{$central_resid};
+                
+                # Set patch datum prediction to 0
+                $datum->prediction(0);
+                # Get corresponding large patch
+                my $lpatch = eval { $lpatches{ $central_resid } };
+
+                if (! $lpatch) {
+                    croak "No lpatch was found for patch with central resid"
+                        . " $central_resid";
+                }
+                
+                # Foreach resid of large patch, check if this exists in
+                # pos_preds hash - if so, change datum prediction to 1
+                foreach my $resid ( keys %{ $lpatch->resid_index } ) {
+                    # Avoid self-matching
+                    next if $resid eq $central_resid;
+                    
+                    if ( exists $pos_preds{$resid} ) {
+                        $datum->prediction(1);
+                        last;
+                    }
+                }
+                # Set per residues predictions
+                my %patch_res_id = %{ $datum->object->patch->pdbresid_index }; 
+                foreach my $pdbresid ( keys %patch_res_id ) {
+                    $pdbresid_h{$pdbresid}->[0] = $datum->value();
+                    $pdbresid_h{$pdbresid}->[1] = $datum->prediction();
+                }
+                $self->confusion_table_patch->add_datum($datum);  
+            }
+        }
+        
+        # Add predictions to residue confusion matrices
+        foreach my $pdbresid (keys %pdbresid_h) {
+            my $res_obj = bless { pdbresid => $pdbresid }, 'pdbresid';
+
+            my $datum = datum->new(object => $res_obj,
+                                   value => $pdbresid_h{$pdbresid}->[0],
+                                   prediction => $pdbresid_h{$pdbresid}->[1],
+                               );
+            
+            # If residue was found in any patch, add to surface conf. mat.
+            if ($pdbresid_h{$pdbresid}->[2]) {
+                $self->confusion_table_surf_residues->add_datum($datum);
+            }
+            $self->confusion_table_all_residues->add_datum($datum);
+        }
+    }
+    return 1;
+}
+
+sub label_patch {
+    my ($self, $patch, $antigen, $pdbresid_h, $pos_preds_h) = @_;
+
+    my @epitope_atoms = grep {$_->is_epitope()} @{$antigen->atom_array()};
+    my $test_patch
+        = test_patch->new(patch => $patch,
+                          parent => $antigen,
+                          patchlib => $self->patchlib,
+                          classifier => $self->classifier,
+                          epitope_atom_array => [@epitope_atoms],
+                      );
+    
+    # Get real and predicted values for confusion table
+    my $patch_value = $test_patch->is_epitope;
+    my $prediction  = $test_patch->test;
+    
+    my $datum = datum->new(object => $test_patch,
+                           prediction => $prediction,
+                           value => $patch_value);
+    
+    # Get patch pdbresids and add per-residue prediction and value
+    my %patch_res_id = %{$test_patch->patch->pdbresid_index};
+    foreach my $pdbresid (keys %patch_res_id) {
+        # Surface residue flag
+        $pdbresid_h->{$pdbresid}->[2] = 1;
+        
+        # Any residue is defined epitope or pos prediction if it
+        # is contained in at least one patch of that type.
+        # Or, if user has supplied pdbResID2LabelHref, take label
+        # from this.
+        if ($patch_value) {
+            if ($self->has_pdbResID2LabelHref) {
+                croak "No label supplied for res $pdbresid!"
+                    if ! exists $self->pdbResID2LabelHref->{$pdbresid};
+                $pdbresid_h->{$pdbresid}->[0] = $self->pdbResID2LabelHref->{$pdbresid};
+            }
+            else {
+                $pdbresid_h->{$pdbresid}->[0] = $patch_value;
+            }
+                }  
+        if ($prediction) {
+            $pdbresid_h->{$pdbresid}->[1] = $prediction;
+        }
+    }
+    
+    # If cluster mode and pos prediction, add to pos predictions
+    if ($prediction && $self->cluster) {
+        my $chainID  = $patch->central_atom->chainID;
+        my $resSeq   = $patch->central_atom->resSeq;
+        my $resid    = $chainID . $resSeq;
+        $resid .= $patch->central_atom->iCode()
+            if $patch->central_atom->has_iCode;
+        
+        my $pdbresid = $patch->pdb_code() . $resid;
+        $pos_preds_h->{$pdbresid} = $datum;
+    }
+    else {
+        $self->confusion_table_patch->add_datum($datum);
+    }
+}
+
+package test_classifier::input;
+use Carp;
+use pdb;
+use pdb::get_files;
+
+sub parse_antigens_from_reslabel_file {
+    my $file = shift;
+    open(my $IN, "<", $file) or die "Cannot open file $file, $!";
+    my %pdbID2ResIDAref = ();
+    map {chomp $_; push(@{$pdbID2ResIDAref{substr($_, 0, 6)}}, $_)} <$IN>;
+
+    my @chains;
+    
+    while (my($pdbID, $resIDAref) = each %pdbID2ResIDAref) {
+        my ($pdbCode, $chainID) = split(/:/, $pdbID);
+        my @resIDs;
+        foreach my $resID (@{$resIDAref}) {
+            my ($pdbCode, $chainID, $resSeq, $isEpitope)
+                = split(/:/, $resID);
+            push(@resIDs, "$chainID.$resSeq") if $isEpitope;
+        }
+        my $chain = get_chain($pdbCode, $chainID);
+        $chain->labelEpitopeAtoms(@resIDs);
+        push(@chains, $chain);
+    }
+    return @chains;
+}
+
+sub parse_antigens {
+    my($file) = @_;
+    
+    open(my $fh, '<', $file )
+        or die "Cannot open input antigen file $file - $!";
+    
+    my $data;
+    {
+        local $/;
+        $data= <$fh>;
+    }
+    close $fh;
+    
+    my @chains = ();
+    my %antigen = ($data
+                       =~ m{ pdbid: \s*? ( \d \w{3} [A-Z] )  \s*? #pdbid
+                             epitope \s residues: \s*? [A-Z]: \s*?
+                             ([^\n]*) }gxmsi ); # seqRes string
+    
+    foreach my $pdbid (keys %antigen) {
+        my $pdb_code = substr($pdbid, 0, 4);
+        my $chain_id = substr($pdbid, 4, 1);
+        
+        # Parse seqRes from string, append to chain_id
+        $antigen{$pdbid}
+            =  [ map { "$chain_id." . $_ }
+                     ( $antigen{$pdbid}  =~ m{ [A-Z] (\d+) }gxmsi ) ];
+        
+
+        my $chain = get_chain($pdb_code, $chain_id);
+        $chain->labelEpitopeAtoms(@{$antigen{$pdbid}});
+        push(@chains, $chain);
+        
+    }
+    croak "No antigens parsed from antigen input file $file"
+        if ! @chains;
+
+    return @chains;
+}
+
+sub get_chain {
+    my ($pdb_code, $chain_id) = @_;
+    # Get pdb and xmas files
+    my $get_files = pdb::get_files->new( pdb_code => $pdb_code );
+    my $pdb_file  = $get_files->pdb_file();
+    
+    return chain->new(pdb_code  => $pdb_code,
+                      chain_id  => $chain_id,
+                      pdb_file  => $pdb_file,
+                      het_atom_cleanup => 1,
+                      solvent_cleanup => 1);
+}
+
+sub getPDBResID2LabelFromFile {
+    my $file = shift;
+    open(my $IN, "<", $file) or die "Cannot open file $file, $!";
+    my %pdbResID2Label = ();
+    while (my $line = <$IN>) {
+        chomp $line;
+        my ($pdbCode, $chainID, $resSeq, $isEpitope)
+            = split(/:/, $line);
+        $pdbCode = lc $pdbCode;
+        $pdbResID2Label{"$pdbCode$chainID.$resSeq"} = $isEpitope;
+    }
+    return %pdbResID2Label;
+}
+
+1;
