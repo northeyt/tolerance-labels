@@ -1,10 +1,14 @@
-## To generate tolerance labels for human-antibody antigen:
+# Tolerance Labels
+
+## Generating tolerance labels
+
+### To generate tolerance labels for human-antibody antigen:
 
 ```
 ./scripts/get_tolerance_labels.pl -in my_chain.list -c -p data/human_TSL.dump -out my_out_dir/ -i -x data/human_best_grouping_scheme.dat
 ```
 
-To generate tolerance labels for mouse-antibody antigen:
+### To generate tolerance labels for mouse-antibody antigen:
 
 ```
 ./scripts/get_tolerance_labels.pl -in my_chain.list -c -p data/human_TSL.dump -out my_out_dir/ -i -x data/human_best_grouping_scheme.dat
@@ -18,13 +22,17 @@ If you have a list of PDB files rather than PDB codes, change the -c option to -
 
 Input format example for list of PDB chains:
 
+```
 1a2y C
 2qza A B
+```
 
 Input format example list of PDB files:
 
+```
 path/to/1a2y.pdb C
 path/to/2qza.pdb A B
+```
 
 ## Combining tolerance labels with IntPred
 
